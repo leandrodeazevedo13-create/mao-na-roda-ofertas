@@ -11,10 +11,11 @@ export async function POST(req:Request){
     const key = process.env.GEMINI_API_KEY
     const buf = await fetch(image_url).then(r=>r.arrayBuffer())
     const b64 = Buffer.from(buf).toString('base64')
-    const prompt = `Extraia TODOS os produtos com preco deste encarte Shibata. Para cada produto retorne title e price. Formato JSON array apenas: [{"title":"Nome completo","price":11.90}] . Seja preciso no titulo.`
+    // pede bbox 0-1000 para recorte
+    const prompt = `Neste encarte de supermercado, extraia TODOS produtos. Para cada, retorne title, price e bbox da foto do produto no encarte no formato [ymin, xmin, ymax, xmax] 0 a 1000. Formato JSON: [{"title":"Desinfetante Suprema 2L","price":4.49,"bbox":[100,200,300,400]}] Minimo 10.`
 
-    const priority = ['gemini-3.8-flash','gemini-3.7-flash','gemini-3.6-flash','gemini-3.5-flash','gemini-3.5-flash-lite']
-    let finalJson:any=null, used='', lastErr:any=null
+    const priority = ['gemini-3.8-flash','gemini-3.7-flash','gemini-3.6-flash','gemini-3.5-flash']
+    let finalJson:any=null, used=''
     for(const m of priority){
       const r = await fetch(`https://generativelanguage.googleapis.com/v1/models/${m}:generateContent?key=${key}`,{
         method:'POST', headers:{'Content-Type':'application/json'},
@@ -25,31 +26,38 @@ export async function POST(req:Request){
       })
       const j = await r.json()
       if(j.candidates){ finalJson=j; used=m; break }
-      lastErr=j
     }
-    if(!finalJson) return Response.json({ok:false,lastErr},{status:500,headers})
+    if(!finalJson) return Response.json({ok:false},{status:500,headers})
 
     const raw = finalJson.candidates[0].content.parts[0].text||''
-    // parser robusto que pega mesmo se JSON quebrar no meio
     let produtos:any[]=[]
     try{
-      const clean = raw.replace(/```json/g,'').replace(/```/g,'').trim()
-      const match = clean.match(/\[[\s\S]*\]/)
-      if(match) produtos = JSON.parse(match[0])
+      const m = raw.match(/\[[\s\S]*\]/)
+      if(m) produtos = JSON.parse(m[0])
     }catch{}
-    // fallback regex: pega todos os {"title":..., "price":...} mesmo cortado
-    if(produtos.length < 5){
-      const re = /\{\s*"title"\s*:\s*"([^"]+)"\s*,\s*"price"\s*:\s*([0-9]+\.?[0-9]*)/g
-      let m; const tmp:any[]=[]
-      while((m=re.exec(raw))!==null){ tmp.push({title:m[1], price: parseFloat(m[2])}) }
-      if(tmp.length>produtos.length) produtos=tmp
+    // fallback regex com bbox
+    if(produtos.length < 3){
+      const re = /"title"\s*:\s*"([^"]+)"[^}]*"price"\s*:\s*([0-9.]+)[^}]*"bbox"\s*:\s*\[([^\]]+)\]/g
+      let mm; const tmp:any[]=[]
+      while((mm=re.exec(raw))!==null){
+        const bbox = mm[3].split(',').map((x:string)=>parseInt(x.trim()))
+        tmp.push({title:mm[1], price: parseFloat(mm[2]), bbox})
+      }
+      if(tmp.length>0) produtos=tmp
     }
 
-    if(produtos.length===0) produtos=[{title:"Panettone Frutas 400g",price:11.9},{title:"Arroz 5kg",price:27.9}]
+    const ofertas = produtos.map((p:any)=>({
+      store_name: store_name||'Shibata',
+      title: p.title,
+      price: p.price,
+      image_url,
+      bbox: p.bbox||null,
+      status:'active',
+      neighborhood:'Ubatuba'
+    }))
 
-    const ofertas = produtos.map((p:any)=>({store_name:store_name||'Shibata',title:p.title,price:p.price,image_url,status:'active',neighborhood:'Ubatuba'}))
     if(ofertas.length>0){
-      await supabase.from('offers').delete().eq('store_name','Shibata')
+      await supabase.from('offers').delete().eq('image_url', image_url)
       await supabase.from('offers').insert(ofertas)
     }
 
