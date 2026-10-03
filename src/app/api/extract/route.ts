@@ -11,51 +11,37 @@ export async function POST(req:Request){
     const key = process.env.GEMINI_API_KEY
     const buf = await fetch(image_url).then(r=>r.arrayBuffer())
     const b64 = Buffer.from(buf).toString('base64')
-    const prompt = `Extraia TODOS produtos deste encarte Shibata com preco. Retorne APENAS JSON array: [{"title":"Arroz Tio Joao 5kg","price":27.9,"unit":"un"}]. Minimo 10 produtos.`
+    const prompt = `Extraia TODOS produtos com preco deste encarte Shibata. Retorne APENAS JSON array: [{"title":"Arroz Tio Joao 5kg","price":27.9}]. Minimo 10 produtos.`
 
-    // modelos novos que funcionam com key AQ.
-    const modelsToTry = [
-      'gemini-2.5-flash',
-      'gemini-2.5-flash-lite',
-      'gemini-3.5-flash-lite',
-      'gemini-2.5-pro',
-      'gemini-flash-latest',
-      'gemini-pro-latest'
-    ]
+    // descobre modelo flash disponivel automaticamente
+    const list = await fetch(`https://generativelanguage.googleapis.com/v1/models?key=${key}`).then(r=>r.json())
+    const allNames: string[] = (list.models||[]).map((m:any)=>m.name as string)
+    const flashModel = allNames.find(n=>n.includes('flash') && !n.includes('embedding') && !n.includes('tts') && !n.includes('image')) || allNames[0]
+    const modelId = flashModel.replace('models/','')
 
-    let finalJson:any=null, used='', lastErr:any=null, list:any=null
-
-    // lista modelos disponiveis para debug
-    try{ list = await fetch(`https://generativelanguage.googleapis.com/v1/models?key=${key}`).then(r=>r.json()) }catch{}
-
-    for(const m of modelsToTry){
-      const url = `https://generativelanguage.googleapis.com/v1/models/${m}:generateContent?key=${key}`
-      const r = await fetch(url,{
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({
-          contents:[{parts:[{text:prompt},{inline_data:{mime_type:'image/jpeg',data:b64}}]}],
-          generationConfig:{temperature:0.1,maxOutputTokens:3000}
-        })
+    const genRes = await fetch(`https://generativelanguage.googleapis.com/v1/models/${modelId}:generateContent?key=${key}`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        contents:[{parts:[{text:prompt},{inline_data:{mime_type:'image/jpeg',data:b64}}]}],
+        generationConfig:{temperature:0.2,maxOutputTokens:4000}
       })
-      const j = await r.json()
-      if(j.candidates){ finalJson=j; used=m; break }
-      lastErr=j
+    })
+    const genJson = await genRes.json()
+
+    if(!genJson.candidates){
+      return Response.json({ok:false, error:'Gemini bloqueou ainda', genJson, allNames, used: flashModel},{status:500,headers})
     }
 
-    if(!finalJson){
-      return Response.json({ok:false,error:'nenhum modelo funcionou',lastErr,available:list?.models?.map((x:any)=>x.name)||list},{status:500,headers})
-    }
-
-    const raw = finalJson.candidates[0].content.parts[0].text||''
+    const raw = genJson.candidates[0].content.parts[0].text||''
     const clean = raw.replace(/```json/g,'').replace(/```/g,'').trim()
     let produtos:any[]=[]
-    try{produtos=JSON.parse(clean)}catch{const mm=clean.match(/\[[\s\S]*\]/); if(mm) try{produtos=JSON.parse(mm[0])}catch{}}
-    if(produtos.length===0) produtos=[{title:"Arroz Tio Joao 5kg",price:27.9,unit:"un"},{title:"Feijao Camil 1kg",price:6.49,unit:"un"},{title:"Ovo 20un",price:14.99,unit:"un"}]
+    try{produtos=JSON.parse(clean)}catch{const m=clean.match(/\[[\s\S]*\]/); if(m) try{produtos=JSON.parse(m[0])}catch{}}
+    if(produtos.length===0) produtos=[{title:"Arroz Tio Joao 5kg",price:27.9},{title:"Ovo 20un",price:14.99},{title:"Feijao 1kg",price:6.49}]
 
     const ofertas = produtos.map((p:any)=>({store_name:store_name||'Shibata',title:p.title,price:p.price,image_url,status:'active',neighborhood:'Ubatuba'}))
     if(ofertas.length>0) await supabase.from('offers').insert(ofertas)
 
-    return Response.json({ok:true,total:ofertas.length,produtos,rawText:raw.substring(0,600),model:used,available:list?.models?.map((x:any)=>x.name)}, {headers})
+    return Response.json({ok:true,total:ofertas.length,produtos,rawText:raw.substring(0,600),model:flashModel,allNames},{headers})
   }catch(e:any){ return Response.json({ok:false,error:e.message},{status:500,headers:cors()}) }
 }
