@@ -6,97 +6,76 @@ const supabase = createClient(
   { auth: { persistSession: false } }
 )
 
-export async function GET() {
+export async function GET(req: Request) {
+  const { searchParams } = new URL(req.url)
+  const store = (searchParams.get('store') || 'semar').toLowerCase()
+
   try {
-    // 1. Pega HTML da home + também tenta pegar o JSON da VTEX onde ficam os banners
-    const [homeRes, bannerApiRes] = await Promise.all([
-      fetch('https://www.semarentrega.com.br/', {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120', Accept: 'text/html', 'Accept-Language': 'pt-BR' },
+    let banners: string[] = []
+    let storeName = 'Semar'
+
+    if (store === 'shibata') {
+      storeName = 'Shibata'
+      const res = await fetch('https://shibata.com.br/ofertas/', {
+        headers: { 'User-Agent': 'Mozilla/5.0 Chrome/120', 'Accept': 'text/html', 'Accept-Language': 'pt-BR' },
         cache: 'no-store'
-      }),
-      // VTEX CMS - onde o Semar cadastra os banners - geralmente é público
-      fetch('https://www.semarentrega.com.br/api/dataentities/banner/documents?_fields=bannerUrl,linkUrl,nome&_where=isActive=true', {
-        headers: { 'User-Agent': 'Mozilla/5.0 Chrome/120' },
-        cache: 'no-store'
-      }).catch(() => null)
-    ])
-
-    if (!homeRes.ok) throw new Error(`Home ${homeRes.status}`)
-    const html = await homeRes.text()
-
-    const found = new Set<string>()
-
-    // Padrão 1: qualquer URL .webp/.jpg que tenha banner (igual você achou no F12)
-    // Pega vtexassets, osuper, s3 - tudo
-    const patterns = [
-      /https:\/\/[^\s"'<>]+\/arquivos\/ids\/[^\s"'<>]*?banner[^\s"'<>]*?\.(?:webp|jpg|png)/gi,
-      /https:\/\/[^\s"'<>]*?banner[^\s"'<>]*?oferta[^\s"'<>]*?\.(?:webp|jpg|png)/gi,
-      /https:\/\/[^\s"'<>]*?ofertas?[^\s"'<>]*?semar[^\s"'<>]*?\.(?:webp|jpg|png)/gi,
-      /https:\/\/semarsupermercados\.vtexassets\.com[^\s"'<>]+\.(?:webp|jpg|png)/gi,
-    ]
-
-    for (const rgx of patterns) {
+      })
+      const html = await res.text()
+      // Pega todas as imagens do jornal - wp-content/uploads/...outubro...jpg/png/webp
+      const rgx = /https:\/\/shibata\.com\.br\/wp-content\/uploads\/[^"'\s]+\.(?:jpg|jpeg|png|webp)/gi
+      const set = new Set<string>()
       let m
       while ((m = rgx.exec(html)) !== null) {
-        let url = m[0].replace(/\\u002F/g, '/')
-        // limpa parametros edge
-        url = url.split('?')[0] === url ? url : url
-        if (!url.includes('logo') && !url.includes('icone') && url.length < 500) {
-          found.add(url)
+        const url = m[0]
+        // Ignora logo, icones
+        if (!url.includes('logo') && !url.includes('Shibata-logo') && url.length < 400) {
+          set.add(url)
         }
+      }
+      // Tenta também pegar imagem do Open Graph do jornal
+      const og = html.match(/<meta[^>]+property="og:image"[^>]+content="([^"]+)"/i)
+      if (og) set.add(og[1])
+      banners = Array.from(set).slice(0, 8)
+    } else {
+      // SEMAR - v2 que já tá funcionando
+      storeName = 'Semar'
+      const homeRes = await fetch('https://www.semarentrega.com.br/', {
+        headers: { 'User-Agent': 'Mozilla/5.0 Chrome/120', Accept: 'text/html', 'Accept-Language': 'pt-BR' },
+        cache: 'no-store'
+      })
+      const html = await homeRes.text()
+      const found = new Set<string>()
+      const patterns = [
+        /https:\/\/[^\s"'<>]+\/arquivos\/ids\/[^\s"'<>]*?banner[^\s"'<>]*?\.(?:webp|jpg|png)/gi,
+        /https:\/\/[^\s"'<>]*?banner[^\s"'<>]*?oferta[^\s"'<>]*?\.(?:webp|jpg|png)/gi,
+        /https:\/\/semarsupermercados\.vtexassets\.com[^\s"'<>]+\.(?:webp|jpg|png)/gi,
+      ]
+      for (const rgx of patterns) {
+        let m
+        while ((m = rgx.exec(html)) !== null) {
+          let url = m[0]
+          if (!url.toLowerCase().includes('logo') && url.length < 500) found.add(url)
+        }
+      }
+      banners = Array.from(found).slice(0, 6)
+      if (banners.length === 0) {
+        banners = ['https://semarsupermercados.vtexassets.com/arquivos/ids/155000/banner-mobile-oferta-43anos.jpg']
       }
     }
 
-    // Padrão 2: tenta extrair do JSON embutido no HTML (VTEX coloca os banners num script)
-    const jsonBannerMatches = html.match(/https:\\\/\\\/semarsupermercados\.vtexassets\.com[^"]+banner[^"]+\.(?:webp|jpg|png)/gi)
-    if (jsonBannerMatches) {
-      jsonBannerMatches.forEach(u => found.add(u.replace(/\\\//g, '/').replace(/\\/g, '')))
-    }
-
-    // Padrão 3: se API de banner retornou algo
-    if (bannerApiRes && bannerApiRes.ok) {
-      try {
-        const bannersJson = await bannerApiRes.json()
-        bannersJson.forEach((b: any) => {
-          if (b.bannerUrl) found.add(b.bannerUrl)
-          if (b.imageUrl) found.add(b.imageUrl)
-        })
-      } catch {}
-    }
-
-    // Fallback: se ainda só tem 0 ou 1, injeta os IDs que você mesmo achou no F12 (esses 3 sempre mudam mas o padrão é o mesmo)
-    // Vamos buscar no S3 public listing os últimos banners
-    if (found.size < 2) {
-      try {
-        const s3List = await fetch('https://osuper-ecommerce-semarsupermercados.s3.sa-east-1.amazonaws.com/', { headers: { 'User-Agent': 'Chrome/120' } }).then(r => r.text()).catch(() => '')
-        const s3Matches = s3List.match(/<Key>([^<]*banner[^<]*oferta[^<]*\.webp)<\/Key>/gi)
-        if (s3Matches) {
-          // pega últimos 3
-          s3Matches.slice(-3).forEach(k => {
-            const key = k.replace(/<\/?Key>/gi, '')
-            found.add(`https://osuper-ecommerce-semarsupermercados.s3.sa-east-1.amazonaws.com/${key}`)
-          })
-        }
-      } catch {}
-    }
-
-    const banners = Array.from(found).slice(0, 6)
-
-    // Se ainda só pegou logo, pega pelo menos 1 genérico pra não ficar vazio
-    if (banners.length === 0) {
-      banners.push('https://semarsupermercados.vtexassets.com/arquivos/ids/155000/banner-mobile-oferta-43anos.jpg')
-    }
-
     const ofertas = banners.map((img, idx) => ({
-      store_name: 'Semar',
-      title: idx === 0 ? 'Virada dos Sonhos - 43 Anos Semar' : `Oferta Semar - ${idx + 1}`,
+      store_name: storeName,
+      title: store === 'shibata' 
+        ? (idx === 0 ? 'Jornal de Ofertas Shibata - 02 a 05/10' : `Oferta Shibata ${idx+1}`)
+        : (idx === 0 ? 'Virada dos Sonhos - 43 Anos Semar' : `Oferta Semar ${idx+1}`),
       price: 0,
       image_url: img,
       status: 'active',
-      neighborhood: 'São Miguel - 04'
+      neighborhood: store === 'shibata' ? 'Ubatuba' : 'Sao Miguel - 04'
     }))
 
-    await supabase.from('offers').delete().eq('store_name', 'Semar')
+    // Apaga só da loja atual e insere novas
+    await supabase.from('offers').delete().eq('store_name', storeName)
     if (ofertas.length > 0) {
       const { error } = await supabase.from('offers').insert(ofertas)
       if (error) throw error
@@ -104,11 +83,11 @@ export async function GET() {
 
     return Response.json({
       ok: true,
-      modo: 'AUTOMATICO BANNER v2 - teste',
+      store: storeName,
+      modo: store === 'shibata' ? 'AUTOMATICO SHIBATA' : 'AUTOMATICO BANNER v2',
       total_banners: banners.length,
       banners,
-      ofertas_inseridas: ofertas.length,
-      html_size: html.length
+      ofertas_inseridas: ofertas.length
     })
 
   } catch (e: any) {
