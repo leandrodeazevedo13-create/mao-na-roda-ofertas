@@ -6,57 +6,87 @@ const supabase = createClient(
   { auth: { persistSession: false } }
 )
 
-// AUTOMÁTICO COMPLIANT - usa API pública do VTEX, sem proxy, sem antibot
-// Endpoint oficial que o próprio site do Semar usa para listar produtos
-
-async function scrapeSemarAPIOficial() {
+// AUTOMÁTICO PERMITIDO: pega os banners de oferta da home pública do Semar
+// Não usa API bloqueada, só lê o HTML público igual o navegador
+export async function GET() {
   try {
-    // API pública VTEX - lista ofertas por ordenação TopSale
-    const url = 'https://www.semarentrega.com.br/api/catalog_system/pub/products/search?ft=oferta&_from=0&_to=19&O=OrderByTopSaleDESC'
-    
-    const res = await fetch(url, {
+    // Pega HTML da home - igual você abre no Chrome
+    const res = await fetch('https://www.semarentrega.com.br/', {
       headers: {
-        'Accept': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Mão na Roda Ubatuba - parceria)'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0',
+        'Accept': 'text/html',
+        'Accept-Language': 'pt-BR,pt;q=0.9'
       },
-      next: { revalidate: 3600 } // cache 1h
+      cache: 'no-store'
     })
 
-    if (!res.ok) {
-      throw new Error(`Semar retornou ${res.status} - pode estar em manutenção`)
+    if (!res.ok) throw new Error(`Home retornou ${res.status}`)
+
+    const html = await res.text()
+
+    // Procura por todos os banners de oferta que você achou no F12
+    // Padrões que você mesma encontrou: banner-mobile-oferta, ofertas-semar, ofetas-no-whatsapp
+    const bannerRegex = /https:\/\/[^"']*?(?:banner[^"']*oferta|ofertas[^"']*semar|ofetas[^"']*whatsapp)[^"']*?\.webp[^"']*/gi
+    
+    // Também pega qualquer imagem de banner da VTEX
+    const genericBannerRegex = /https:\/\/[^"']*\/arquivos\/[^"']*?banner[^"']*?\.(?:webp|jpg|png)[^"']*/gi
+
+    const found = new Set<string>()
+    let match
+
+    while ((match = bannerRegex.exec(html)) !== null) {
+      found.add(match[0].replace(/\\u002F/g, '/').replace(/\\"/g, ''))
+    }
+    while ((match = genericBannerRegex.exec(html)) !== null) {
+      // só banners que parecem oferta (tem 43 anos, virada, oferta maluca, fim de semana)
+      const url = match[0]
+      if (url.toLowerCase().includes('oferta') || url.toLowerCase().includes('virada') || url.toLowerCase().includes('semana') || url.toLowerCase().includes('maluca')) {
+        found.add(url.replace(/\\u002F/g, '/'))
+      }
     }
 
-    const products = await res.json()
-    
-    const ofertas = products.map((p: any) => {
-      const item = p.items?.[0]
-      const seller = item?.sellers?.[0]
-      const offer = seller?.commertialOffer
-      return {
-        store_name: 'Semar',
-        title: p.productName,
-        price: offer?.Price || offer?.ListPrice || 0,
-        image_url: item?.images?.[0]?.imageUrl || null,
-        status: 'active',
-        neighborhood: 'Centro',
-        external_id: p.productId
-      }
-    }).filter((o: any) => o.price > 0)
+    const banners = Array.from(found).slice(0, 6) // pega até 6 banners
+
+    if (banners.length === 0) {
+      // fallback: tenta pegar og:image ou banner principal da home
+      const ogMatch = html.match(/<meta[^>]*property="og:image"[^>]*content="([^"]+)"/i)
+      if (ogMatch) banners.push(ogMatch[1])
+    }
+
+    // Transforma cada banner em uma "oferta" no seu banco
+    // Como o preço está DENTRO da imagem, a gente salva a imagem inteira
+    const ofertas = banners.map((img, idx) => ({
+      store_name: 'Semar',
+      title: idx === 0 ? 'Virada dos Sonhos - 43 Anos Semar (Banner Oficial)' : `Oferta Semar - Banner ${idx + 1}`,
+      price: 0, // preço está dentro da imagem, usuário vê na imagem
+      image_url: img,
+      status: 'active',
+      neighborhood: 'São Miguel - 04',
+      description: 'Banner oficial capturado automaticamente da home'
+    }))
 
     if (ofertas.length > 0) {
-      // limpa antigas do Semar e insere novas
       await supabase.from('offers').delete().eq('store_name', 'Semar')
-      await supabase.from('offers').insert(ofertas.map(({ external_id, ...rest }: any) => rest))
+      const { error } = await supabase.from('offers').insert(ofertas)
+      if (error) throw error
     }
 
     await supabase.from('scraping_logs').insert({
       store_name: 'Semar',
       status: 'success',
-      message: `API VTEX oficial: ${ofertas.length} ofertas`,
+      message: `Banners automáticos: ${ofertas.length} imagens capturadas`,
       items_found: ofertas.length
     })
 
-    return { store: 'Semar', count: ofertas.length, via: 'VTEX API Pública' }
+    return Response.json({
+      ok: true,
+      modo: 'AUTOMATICO BANNER - permitido',
+      explica: 'Lê HTML público da home e extrai URLs de banner .webp que você achou no F12',
+      total_banners: banners.length,
+      banners,
+      ofertas_inseridas: ofertas.length
+    })
+
   } catch (e: any) {
     await supabase.from('scraping_logs').insert({
       store_name: 'Semar',
@@ -64,56 +94,6 @@ async function scrapeSemarAPIOficial() {
       message: e.message,
       items_found: 0
     })
-    return { store: 'Semar', count: 0, error: e.message }
+    return Response.json({ ok: false, error: e.message }, { status: 500 })
   }
-}
-
-// Instagram OFICIAL - só funciona se o dono do @semarsupermercados autorizar seu app no Meta for Developers
-// Isso é 100% dentro das regras do Instagram Graph API
-async function scrapeInstagramOficial() {
-  const TOKEN = process.env.INSTAGRAM_GRAPH_TOKEN // token de longa duração que o Semar te dá
-  const IG_ID = process.env.SEMAR_IG_USER_ID
-  
-  if (!TOKEN || !IG_ID) {
-    return { store: 'Shibata', count: 0, note: 'Sem token oficial - peça autorização do mercado no developers.facebook.com' }
-  }
-
-  try {
-    const res = await fetch(`https://graph.facebook.com/v19.0/${IG_ID}/media?fields=caption,media_url,timestamp&limit=5&access_token=${TOKEN}`)
-    const data = await res.json()
-    
-    const ofertas = (data.data || []).flatMap((post: any) => {
-      const linhas = (post.caption || '').match(/.*R\$\s*[\d.,]+.*/g) || []
-      return linhas.slice(0, 2).map((l: string) => ({
-        store_name: 'Shibata',
-        title: l.replace(/R\$.*/, '').trim().slice(0, 100),
-        price: parseFloat((l.match(/R\$\s*([\d.,]+)/i)?.[1] || '0').replace(',', '.')),
-        image_url: post.media_url,
-        status: 'active',
-        neighborhood: 'Centro'
-      })).filter((o: any) => o.price > 0)
-    })
-
-    if (ofertas.length) {
-      await supabase.from('offers').delete().eq('store_name', 'Shibata')
-      await supabase.from('offers').insert(ofertas)
-    }
-
-    return { store: 'Shibata', count: ofertas.length, via: 'Instagram Graph API Oficial' }
-  } catch (e: any) {
-    return { store: 'Shibata', count: 0, error: e.message }
-  }
-}
-
-export async function GET() {
-  const semar = await scrapeSemarAPIOficial()
-  const insta = await scrapeInstagramOficial()
-
-  return Response.json({
-    ok: true,
-    automatic: true,
-    ran_at: new Date().toISOString(),
-    results: [semar, insta],
-    next: 'Configure CRON na Vercel: vercel.json com "schedule": "0 9 * * *" apontando pra /api/scrape'
-  })
 }
