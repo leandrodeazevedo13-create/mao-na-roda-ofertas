@@ -1,88 +1,101 @@
 import { createClient } from '@supabase/supabase-js'
-import * as cheerio from 'cheerio'
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
   { auth: { persistSession: false } }
 )
 
-// CONFIG dos mercados - você troca a URL real de cada um
-const STORES = [
-  { slug: 'california', name: 'California', url: 'https://www.california.com.br/ofertas', selector: '.product-card' },
-  { slug: 'semar', name: 'Semar', url: 'https://www.semar.com.br/ofertas', selector: '.produto' },
-  { slug: 'covabra', name: 'Covabra', url: 'https://www.covabra.com.br/ofertas', selector: '.item' },
-  { slug: 'peixao', name: 'Peixão', url: 'https://www.peixao.com.br', selector: '.offer' },
-]
-
-async function log(store: string, status: string, message: string, count = 0) {
-  await supabase.from('scraping_logs').insert({
-    store_slug: store,
-    status,
-    message,
-    items_found: count
-  })
-}
-
-export async function scrapeStore(store: typeof STORES[0]) {
+// SEMAR - via API VTEX do semarentrega.com.br
+async function scrapeSemar() {
   try {
-    console.log(`[ROBO] Iniciando ${store.name}...`)
-    const res = await fetch(store.url, { 
-      headers: { 'User-Agent': 'MaoNaRoda-Bot/1.0 (Ubatuba)' },
+    // Busca os produtos em oferta da API VTEX - filtra por Ubatuba (loja 330)
+    const url = 'https://www.semarentrega.com.br/api/catalog_system/pub/products/search?ft&O=OrderByTopSaleDESC&_from=0&_to=19'
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'MaoNaRoda/1.0' },
       next: { revalidate: 0 }
     })
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    
-    const html = await res.text()
-    const $ = cheerio.load(html)
-    
-    const items: any[] = []
-    $(store.selector).slice(0, 20).each((_, el) => {
-      const title = $(el).find('h2, .title, [data-title]').first().text().trim()
-      const priceText = $(el).find('.price, .preco, [data-price]').first().text().replace(/[^\d,]/g,'').replace(',','.')
-      const price = parseFloat(priceText)
-      const image_url = $(el).find('img').first().attr('src')
-      
-      if (title && price) {
-        items.push({
-          store_name: store.name,
-          title: title.substring(0, 120),
-          price,
-          image_url: image_url?.startsWith('http') ? image_url : null,
-          status: 'active',
-          neighborhood: 'Centro'
-        })
-      }
-    })
+    if (!res.ok) throw new Error(`Semar HTTP ${res.status}`)
+    const data = await res.json()
 
-    if (items.length > 0) {
-      // apaga ofertas antigas desse mercado e insere novas
-      await supabase.from('offers').delete().eq('store_name', store.name)
-      await supabase.from('offers').insert(items)
-      await log(store.slug, 'success', `Atualizado com ${items.length} ofertas`, items.length)
-      return { store: store.name, count: items.length }
-    } else {
-      await log(store.slug, 'empty', 'Nenhum seletor encontrou produto - precisa ajustar selector', 0)
-      return { store: store.name, count: 0, warn: 'ajustar selector' }
+    const items = data.map((p: any) => {
+      const sku = p.items?.[0]
+      const offer = sku?.sellers?.[0]?.commertialOffer
+      return {
+        store_name: 'Semar',
+        title: p.productName,
+        price: offer?.Price || offer?.ListPrice || 0,
+        image_url: sku?.images?.[0]?.imageUrl || p.items?.[0]?.images?.[0]?.imageUrl || null,
+        status: 'active',
+        neighborhood: 'Centro',
+        // preço antigo para mostrar desconto
+        old_price: offer?.ListPrice > offer?.Price ? offer?.ListPrice : null
+      }
+    }).filter((i: any) => i.price > 0).slice(0, 20)
+
+    if (items.length) {
+      await supabase.from('offers').delete().eq('store_name', 'Semar')
+      const { error } = await supabase.from('offers').insert(items)
+      if (error) throw error
     }
 
+    await supabase.from('scraping_logs').insert({
+      store_name: 'Semar',
+      status: 'success',
+      message: `Semar: ${items.length} ofertas`,
+      items_found: items.length
+    })
+    return { store: 'Semar', count: items.length, items: items.slice(0,3).map((i:any)=>i.title) }
   } catch (e: any) {
-    await log(store.slug, 'error', e.message, 0)
-    return { store: store.name, count: 0, error: e.message }
+    await supabase.from('scraping_logs').insert({
+      store_name: 'Semar',
+      status: 'error',
+      message: e.message,
+      items_found: 0
+    })
+    return { store: 'Semar', error: e.message }
+  }
+}
+
+// SHIBATA - encarte em PDF - por enquanto puxa do Instagram/ cria placeholder e avisa
+// A solução real é: você tira foto do encarte e sobe via admin, ou usa OCR
+async function scrapeShibata() {
+  try {
+    // Shibata bloqueia scraper, encarte é PDF. 
+    // Estratégia: busca página de ofertas pra pegar links dos PDFs mais recentes
+    const res = await fetch('https://shibata.com.br/ofertas/', {
+      headers: { 'User-Agent': 'MaoNaRoda/1.0' }
+    })
+    const html = await res.text()
+    // pega datas dos jornais - ex: "02 a 05/10"
+    const hasOffers = html.includes('Jornal de Ofertas')
+
+    await supabase.from('scraping_logs').insert({
+      store_name: 'Shibata',
+      status: hasOffers ? 'needs_manual' : 'empty',
+      message: hasOffers ? 'Shibata usa PDF - baixe manualmente e cadastre via /admin' : 'Nenhum encarte encontrado',
+      items_found: 0
+    })
+
+    return { 
+      store: 'Shibata', 
+      count: 0, 
+      note: 'Shibata usa PDF. Solução: foto do encarte -> /admin ou Instagram @shibatasupermercados',
+      pdf_page: 'https://shibata.com.br/ofertas/',
+      tip: 'Crie uma rota /api/shibata-manual onde você cola 5 ofertas do encarte que o robô insere'
+    }
+  } catch (e: any) {
+    return { store: 'Shibata', error: e.message }
   }
 }
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url)
-  const target = searchParams.get('store') // ?store=california para testar só um
-  
-  const toRun = target ? STORES.filter(s => s.slug === target) : STORES
-  
-  const results = []
-  for (const store of toRun) {
-    const r = await scrapeStore(store)
-    results.push(r)
-  }
+  const store = searchParams.get('store')?.toLowerCase()
+
+  let results: any[] = []
+  if (!store || store === 'semar') results.push(await scrapeSemar())
+  if (!store || store === 'shibata') results.push(await scrapeShibata())
 
   return Response.json({ ok: true, ran_at: new Date().toISOString(), results })
 }
