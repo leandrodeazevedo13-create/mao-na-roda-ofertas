@@ -1,6 +1,6 @@
 'use client'
 import { useEffect, useState } from 'react'
-import { ProductCard } from '@/components/ProductCard'
+import ProductCard from "@/components/ProductCard"
 import { createClient } from '@supabase/supabase-js'
 
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!)
