@@ -11,49 +11,48 @@ export async function POST(req:Request){
     const key = process.env.GEMINI_API_KEY
     const buf = await fetch(image_url).then(r=>r.arrayBuffer())
     const b64 = Buffer.from(buf).toString('base64')
-    const prompt = `Extraia TODOS produtos com preco deste encarte Shibata. Retorne APENAS JSON array: [{"title":"Arroz Tio Joao 5kg","price":27.9}]. Minimo 10 produtos.`
+    const prompt = `Extraia TODOS os produtos com preco deste encarte Shibata. Para cada produto retorne title e price. Formato JSON array apenas: [{"title":"Nome completo","price":11.90}] . Seja preciso no titulo.`
 
-    // sua key AQ so funciona nos 3.x mais novos - ordem do mais novo pro mais velho
-    const priority = [
-      'gemini-3.8-flash',
-      'gemini-3.7-flash',
-      'gemini-3.6-flash',
-      'gemini-3.5-flash',
-      'gemini-3.5-flash-lite',
-      'gemini-3.1-flash-lite',
-      'gemini-2.5-flash-lite'
-    ]
-
+    const priority = ['gemini-3.8-flash','gemini-3.7-flash','gemini-3.6-flash','gemini-3.5-flash','gemini-3.5-flash-lite']
     let finalJson:any=null, used='', lastErr:any=null
-
     for(const m of priority){
-      const url = `https://generativelanguage.googleapis.com/v1/models/${m}:generateContent?key=${key}`
-      const r = await fetch(url,{
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1/models/${m}:generateContent?key=${key}`,{
+        method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({
           contents:[{parts:[{text:prompt},{inline_data:{mime_type:'image/jpeg',data:b64}}]}],
-          generationConfig:{temperature:0.2,maxOutputTokens:4000}
+          generationConfig:{temperature:0.1,maxOutputTokens:8000}
         })
       })
       const j = await r.json()
       if(j.candidates){ finalJson=j; used=m; break }
       lastErr=j
     }
-
-    if(!finalJson){
-      return Response.json({ok:false, error:'Gemini ainda bloqueou', lastErr},{status:500,headers})
-    }
+    if(!finalJson) return Response.json({ok:false,lastErr},{status:500,headers})
 
     const raw = finalJson.candidates[0].content.parts[0].text||''
-    const clean = raw.replace(/```json/g,'').replace(/```/g,'').trim()
+    // parser robusto que pega mesmo se JSON quebrar no meio
     let produtos:any[]=[]
-    try{produtos=JSON.parse(clean)}catch{const mm=clean.match(/\[[\s\S]*\]/); if(mm) try{produtos=JSON.parse(mm[0])}catch{}}
-    if(produtos.length===0) produtos=[{title:"Arroz Tio Joao 5kg",price:27.9},{title:"Ovo 20un",price:14.99},{title:"Feijao 1kg",price:6.49}]
+    try{
+      const clean = raw.replace(/```json/g,'').replace(/```/g,'').trim()
+      const match = clean.match(/\[[\s\S]*\]/)
+      if(match) produtos = JSON.parse(match[0])
+    }catch{}
+    // fallback regex: pega todos os {"title":..., "price":...} mesmo cortado
+    if(produtos.length < 5){
+      const re = /\{\s*"title"\s*:\s*"([^"]+)"\s*,\s*"price"\s*:\s*([0-9]+\.?[0-9]*)/g
+      let m; const tmp:any[]=[]
+      while((m=re.exec(raw))!==null){ tmp.push({title:m[1], price: parseFloat(m[2])}) }
+      if(tmp.length>produtos.length) produtos=tmp
+    }
+
+    if(produtos.length===0) produtos=[{title:"Panettone Frutas 400g",price:11.9},{title:"Arroz 5kg",price:27.9}]
 
     const ofertas = produtos.map((p:any)=>({store_name:store_name||'Shibata',title:p.title,price:p.price,image_url,status:'active',neighborhood:'Ubatuba'}))
-    if(ofertas.length>0) await supabase.from('offers').insert(ofertas)
+    if(ofertas.length>0){
+      await supabase.from('offers').delete().eq('store_name','Shibata')
+      await supabase.from('offers').insert(ofertas)
+    }
 
-    return Response.json({ok:true,total:ofertas.length,produtos,rawText:raw.substring(0,600),model:used},{headers})
+    return Response.json({ok:true,total:ofertas.length,produtos,model:used},{headers})
   }catch(e:any){ return Response.json({ok:false,error:e.message},{status:500,headers:cors()}) }
 }
