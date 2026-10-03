@@ -1,83 +1,103 @@
 'use client'
-import { useState, useRef } from 'react'
-import { supabase } from '@/lib/supabase'
-import { useRouter } from 'next/navigation'
+import { useEffect, useState } from 'react'
+import { createClient } from '@supabase/supabase-js'
 
-export default function Postar() {
-  const [titulo, setTitulo] = useState('')
-  const [preco, setPreco] = useState('')
-  const [foto, setFoto] = useState<File | null>(null)
-  const [preview, setPreview] = useState('')
-  const [gps, setGps] = useState<{lat:number,lng:number} | null>(null)
-  const [loading, setLoading] = useState(false)
-  const fileRef = useRef<HTMLInputElement>(null)
-  const router = useRouter()
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+)
 
-  const pegarGPS = () => {
-    navigator.geolocation.getCurrentPosition(
-      (pos) => setGps({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
-      () => alert('Ativa o GPS!'),
-      { enableHighAccuracy: true }
-    )
-  }
+type Offer = {
+  id: string
+  store_name: string
+  title: string
+  price: number
+  image_url?: string
+  neighborhood?: string
+}
 
-  const handleFoto = (e:any) => {
-    const file = e.target.files[0]
-    if(file){
-      setFoto(file)
-      setPreview(URL.createObjectURL(file))
-      pegarGPS()
-    }
-  }
+export default function Home() {
+  const [offers, setOffers] = useState<Offer[]>([])
+  const [filter, setFilter] = useState('Todos')
 
-  const postar = async () => {
-    if(!titulo ||!preco ||!foto) return alert('Foto, título e preço obrigatórios!')
-    if(!gps) return alert('GPS obrigatório!')
-    setLoading(true)
-    try {
-      const { data: { user } } = await supabase.auth.getUser()
-      if(!user){
-        // cria anonimo pra teste em Ubatuba viralizar sem login
-        const { data: anon } = await supabase.auth.signInAnonymously()
-        if(!anon.user) throw new Error('Erro login')
-      }
-      const { data: { user: u2 } } = await supabase.auth.getUser()
-      const userId = u2!.id
+  useEffect(() => {
+    supabase.from('offers').select('*').eq('status','active').order('created_at', { ascending: false }).limit(40).then(({data}) => {
+      if (data) setOffers(data as any)
+    })
+  }, [])
 
-      const nomeFoto = `${userId}/${Date.now()}.jpg`
-      await supabase.storage.from('ofertas').upload(nomeFoto, foto!)
-      const { data } = supabase.storage.from('ofertas').getPublicUrl(nomeFoto)
+  const stores = ['Todos', ...Array.from(new Set(offers.map(o => o.store_name)))]
 
-      const { error } = await supabase.from('offers').insert({
-        user_id: userId,
-        titulo,
-        preco: parseFloat(preco),
-        foto_url: data.publicUrl,
-        lat: gps.lat,
-        lng: gps.lng
-      })
-      if(error) throw error
-      alert('POSTADO! +10 pontos')
-      router.push('/')
-    } catch (err:any){ alert(err.message) }
-    finally{ setLoading(false) }
-  }
+  const filtered = filter === 'Todos' ? offers : offers.filter(o => o.store_name === filter)
 
   return (
-    <div className="min-h-screen bg-black text-white p-4 max-w-md mx-auto">
-      <h1 className="text-2xl font-bold mb-4">Postar Oferta Real 📸</h1>
-      <div onClick={()=>fileRef.current?.click()} className="w-full h-64 bg-zinc-900 rounded-2xl flex items-center justify-center border-2 border-dashed border-zinc-700 mb-4 overflow-hidden">
-        {preview? <img src={preview} className="w-full h-full object-cover"/> : <span className="text-zinc-500">TOCA PRA TIRAR FOTO</span>}
+    <main style={{ background: '#FFFBEB', minHeight: '100vh', color: '#111827', fontFamily: 'Inter, sans-serif' }}>
+      {/* HEADER */}
+      <header style={{ background: '#111827', color: 'white', padding: '20px 16px', position: 'sticky', top: 0, zIndex: 10 }}>
+        <div style={{ maxWidth: 1100, margin: '0 auto', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <h1 style={{ fontSize: 22, fontWeight: 900, letterSpacing: -1 }}>MÃO NA RODA <span style={{ color: '#FACC15' }}>UBATUBA</span></h1>
+          <span style={{ background: '#FACC15', color: 'black', padding: '6px 12px', borderRadius: 20, fontWeight: 800, fontSize: 12 }}>AO VIVO</span>
+        </div>
+      </header>
+
+      <div style={{ maxWidth: 1100, margin: '0 auto', padding: '16px' }}>
+        <h2 style={{ fontSize: 28, fontWeight: 900, margin: '12px 0 4px' }}>Ofertas de hoje em Ubatuba</h2>
+        <p style={{ color: '#374151', fontWeight: 600, marginBottom: 16 }}>Semar, Shibata, California e mais. Atualizado todo dia.</p>
+
+        {/* FILTRO */}
+        <div style={{ display: 'flex', gap: 8, overflowX: 'auto', paddingBottom: 12 }}>
+          {stores.map(s => (
+            <button
+              key={s}
+              onClick={() => setFilter(s)}
+              style={{
+                padding: '10px 18px',
+                borderRadius: 999,
+                border: '2px solid #111827',
+                background: filter === s ? '#111827' : 'white',
+                color: filter === s ? 'white' : '#111827',
+                fontWeight: 800,
+                fontSize: 14,
+                whiteSpace: 'nowrap'
+              }}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+
+        {/* GRID */}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 12, marginTop: 8 }}>
+          {filtered.map(offer => (
+            <div key={offer.id} style={{ background: 'white', border: '2px solid #111827', borderRadius: 16, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+              <div style={{ height: 120, background: '#F3F4F6', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                {offer.image_url ? (
+                  <img src={offer.image_url} alt={offer.title} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                ) : (
+                  <span style={{ fontSize: 32 }}>🛒</span>
+                )}
+              </div>
+              <div style={{ padding: 10 }}>
+                <span style={{ background: '#FACC15', color: 'black', fontSize: 10, fontWeight: 900, padding: '3px 6px', borderRadius: 6 }}>{offer.store_name?.toUpperCase()}</span>
+                <p style={{ fontWeight: 800, fontSize: 13, lineHeight: 1.2, margin: '6px 0', color: '#111827', minHeight: 32 }}>{offer.title}</p>
+                <p style={{ fontWeight: 900, fontSize: 18, color: '#111827' }}>R$ {Number(offer.price).toFixed(2).replace('.', ',')}</p>
+                {offer.neighborhood && <p style={{ fontSize: 11, color: '#6B7280', fontWeight: 700, marginTop: 2 }}>📍 {offer.neighborhood}</p>}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {filtered.length === 0 && (
+          <div style={{ background: 'white', border: '2px dashed #111827', borderRadius: 16, padding: 24, textAlign: 'center', marginTop: 20 }}>
+            <p style={{ fontWeight: 800 }}>Nenhuma oferta pra {filter} hoje</p>
+            <p style={{ color: '#6B7280', fontSize: 14 }}>Cadastra no /admin ou verifica o Supabase `offers`</p>
+          </div>
+        )}
+
+        <footer style={{ textAlign: 'center', marginTop: 32, padding: 20, color: '#6B7280', fontSize: 12, fontWeight: 600 }}>
+          maonarodaofertas.com.br • Feito em Ubatuba • {new Date().getFullYear()}
+        </footer>
       </div>
-      <input ref={fileRef} type="file" accept="image/*" capture="environment" hidden onChange={handleFoto}/>
-      <input value={titulo} onChange={e=>setTitulo(e.target.value)} placeholder="O que? Ex: Arroz 5kg" className="w-full p-4 rounded-xl bg-zinc-900 mb-3"/>
-      <input value={preco} onChange={e=>setPreco(e.target.value)} type="number" placeholder="Preço? 22.90" className="w-full p-4 rounded-xl bg-zinc-900 mb-3"/>
-      <div className={`p-3 rounded-xl mb-4 ${gps? 'bg-green-900 text-green-300' : 'bg-red-900 text-red-300'}`}>
-        {gps? `✅ GPS OK: ${gps.lat.toFixed(4)}` : '❌ GPS OBRIGATÓRIO'}
-      </div>
-      <button onClick={postar} disabled={loading} className="w-full p-4 bg-white text-black font-black text-xl rounded-xl">
-        {loading? 'POSTANDO...' : 'POSTAR 🚀'}
-      </button>
-    </div>
+    </main>
   )
 }
