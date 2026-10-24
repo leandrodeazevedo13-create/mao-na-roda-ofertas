@@ -3,81 +3,131 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 import { createClient } from "@supabase/supabase-js";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 60;
+export const maxDuration = 300;
+
+const MODELS = ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash"];
+
+async function extractFromImageUrl(url: string, storeName: string, genAI: any) {
+  const prompt = `Extraia TODOS os produtos deste encarte do supermercado ${storeName}.
+Retorne APENAS JSON array: [{"title":"Nome Produto 500g","price":12.99}]
+Regras:
+- title = nome completo com peso/kg/g/un. Ex: "Costelinha Suina KG", "Heineken 350ml"
+- price = numero com ponto. Ex: 15.99
+- Ignore R$0,00, sorteios, vales
+- Minimo 10 produtos se houver
+Apenas JSON, sem markdown.`;
+
+  for (const modelName of MODELS) {
+    try {
+      const model = genAI.getGenerativeModel({ model: modelName });
+      const res = await fetch(url);
+      if (!res.ok) continue;
+      const buf = Buffer.from(await res.arrayBuffer());
+      const mime = url.endsWith(".pdf") ? "application/pdf" : "image/jpeg";
+      const result = await model.generateContent([
+        { text: prompt },
+        { inlineData: { data: buf.toString("base64"), mimeType: mime } }
+      ]);
+      let text = result.response.text().replace(/```json|```/g, "").trim();
+      const s = text.indexOf("[");
+      const e = text.lastIndexOf("]");
+      if (s === -1) continue;
+      const arr = JSON.parse(text.slice(s, e + 1));
+      if (Array.isArray(arr) && arr.length > 0) {
+        console.log(`✅ ${storeName} ${modelName}: ${arr.length} produtos`);
+        return arr;
+      }
+    } catch (err: any) {
+      console.log(`❌ ${modelName} ${storeName}: ${err.message?.slice(0,80)}`);
+    }
+  }
+  return [];
+}
 
 export async function GET() {
-  try {
-    const geminiKey = process.env.GEMINI_API_KEY;
-    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-    const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  const GEMINI_KEY = process.env.GEMINI_API_KEY || process.env.NEXT_PUBLIC_GEMINI_API_KEY || "";
+  const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+  const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 
-    if (!geminiKey || !supabaseUrl || !supabaseKey) {
-      return NextResponse.json({ ok: false, error: "ENV faltando" }, { status: 500 });
-    }
+  if (!GEMINI_KEY) return NextResponse.json({ ok: false, error: "GEMINI_API_KEY faltando" }, { status: 500 });
 
-    const genAI = new GoogleGenerativeAI(geminiKey);
-    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
-    const supabase = createClient(supabaseUrl, supabaseKey);
+  const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+  const genAI = new GoogleGenerativeAI(GEMINI_KEY);
 
-    let totalSalvos = 0;
-    const log: any[] = [];
+  let totalNovos = 0;
+  const logs: string[] = [];
 
-    // 1. SHIBATA - campanhas 700 a 712
-    for (let camp = 700; camp <= 712; camp++) {
-      const url = `https://shibata.com.br/campanhas/${camp}.jpg`;
-      try {
-        const res = await fetch(url);
-        if (!res.ok) continue;
-        const buf = await res.arrayBuffer();
-        const base64 = Buffer.from(buf).toString("base64");
-
-        const prompt = `Extraia TODOS produtos desta oferta de supermercado. 
-        Retorne JSON ARRAY puro: [{"name":"Nome Produto 300g","price":11.9,"category":"mercearia","brand":""}]
-        Regras: name completo com peso, price apenas numero (ex 11.90), category uma de: acougue, bebidas, mercearia, hortifruti, limpeza, pet, etc. Ignore R$0.00. Minimo 15 produtos se houver.`;
-
-        const result = await model.generateContent([
-          { inlineData: { data: base64, mimeType: "image/jpeg" } },
-          { text: prompt }
-        ]);
-        let text = result.response.text();
-        text = text.replace(/```json|```/g, "").trim();
-        const match = text.match(/\[[\s\S]*\]/);
-        if (!match) continue;
-        const produtos = JSON.parse(match[0]);
-
-        for (const p of produtos) {
-          if (!p.name || !p.price || p.price < 0.5) continue;
-          const { error } = await supabase.from("offers").insert({
-            name: p.name.trim(),
-            price: p.price,
-            market: "Shibata",
-            category: p.category || "mercado",
-            brand: p.brand || "",
-            image_url: url,
-            valid_until: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split("T")[0],
-            is_active: true
-          });
-          if (!error) totalSalvos++;
-        }
-        log.push({ camp, qtd: produtos.length });
-      } catch (e) {
-        log.push({ camp, erro: String(e).slice(0,100) });
+  // 1. SHIBATA - campanhas 700 a 720 (imagens .jpg do cluster)
+  logs.push("=== SHIBATA ===");
+  for (let camp = 700; camp <= 720; camp++) {
+    for (let page = 1; page <= 4; page++) {
+      // Tenta 2 formatos de URL que o Shibata usa
+      const urls = [
+        `https://www.loja.shibata.com.br/wp-content/uploads/campanha-${camp}-${page}.jpg`,
+        `https://shibata.com.br/wp-content/uploads/2025/10/campanha-${camp}-cluster-${page}-1200x1571.jpeg`
+      ];
+      for (const url of urls) {
+        try {
+          const head = await fetch(url, { method: "HEAD" });
+          if (!head.ok) continue;
+          const prods = await extractFromImageUrl(url, "Shibata", genAI);
+          if (prods.length) {
+            // limpa duplicatas antigas desse cluster
+            const rows = prods.filter((p: any) => p.price > 0.5 && p.price < 500).map((p: any) => ({
+              title: String(p.title).slice(0, 120).trim(),
+              price: Number(p.price),
+              store_name: "Shibata",
+              image_url: url,
+              neighborhood: "Ubatuba"
+            }));
+            const uniq = Array.from(new Map(rows.map((r: any) => [`${r.title}-${r.price}`, r])).values());
+            if (uniq.length) {
+              await supabase.from("offers").delete().eq("store_name", "Shibata").eq("image_url", url);
+              const { error } = await supabase.from("offers").insert(uniq as any);
+              if (!error) {
+                totalNovos += uniq.length;
+                logs.push(`Shibata ${camp}-${page}: ${uniq.length}`);
+              }
+            }
+            await new Promise(r => setTimeout(r, 1500));
+            break; // achou nessa campanha, vai pra proxima
+          }
+        } catch {}
       }
     }
-
-    // 2. MAXIMO - PDFs 700 a 735
-    for (let pdf = 700; pdf <= 735; pdf++) {
-      const url = `https://supermercadomaximo.b-cdn.net/folhetosdeofertas/folhetos/${pdf}.pdf`;
-      try {
-        const res = await fetch(url, { method: "HEAD" });
-        if (!res.ok) continue;
-        // Por enquanto só loga que existe, extração de PDF vem na próxima versão
-        log.push({ maximo_pdf: pdf, status: "existe" });
-      } catch {}
-    }
-
-    return NextResponse.json({ ok: true, totalSalvos, log, robo: "ativo 2x ao dia Shibata+Maximo" });
-  } catch (err: any) {
-    return NextResponse.json({ ok: false, error: err.message }, { status: 500 });
   }
+
+  // 2. MÁXIMO - PDFs 700 a 740 (705.pdf que você achou)
+  logs.push("=== MAXIMO ===");
+  for (let num = 740; num >= 700; num--) {
+    const url = `https://supermercadomaximo.b-cdn.net/folhetosdeofertas/folhetos/${num}.pdf`;
+    try {
+      const head = await fetch(url, { method: "HEAD" });
+      if (!head.ok) continue;
+      logs.push(`Maximo tentando PDF ${num}`);
+      const prods = await extractFromImageUrl(url, "Máximo", genAI);
+      if (prods.length) {
+        const rows = prods.filter((p: any) => p.price > 0.5).map((p: any) => ({
+          title: String(p.title).slice(0, 120).trim(),
+          price: Number(p.price),
+          store_name: "Máximo",
+          image_url: url,
+          neighborhood: "Ubatuba"
+        }));
+        const uniq = Array.from(new Map(rows.map((r: any) => [`${r.title}-${r.price}`, r])).values());
+        if (uniq.length) {
+          await supabase.from("offers").delete().eq("store_name", "Máximo");
+          await supabase.from("offers").insert(uniq as any);
+          totalNovos += uniq.length;
+          logs.push(`Maximo PDF ${num}: ${uniq.length} - PAROU`);
+          break;
+        }
+      }
+    } catch (e) {}
+  }
+
+  // 3. LIMPEZA GERAL - remove R$0.00 e duplicatas
+  await supabase.from("offers").delete().lte("price", 0.5);
+
+  return NextResponse.json({ ok: true, totalNovos, logs, ranAt: new Date().toISOString(), mensagem: "Robo 2x ao dia ativo" });
 }
