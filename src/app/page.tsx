@@ -18,7 +18,7 @@ export default function Home() {
       const { data } = await supabase
         .from("offers")
         .select("*")
-        .eq("status", "active")
+        .eq("status", "active").gt("price", 0.1)
         .order("price", { ascending: true })
         .limit(100)
       setOffers(data || [])
