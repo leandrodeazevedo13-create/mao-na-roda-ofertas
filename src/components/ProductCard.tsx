@@ -56,3 +56,4 @@ export default function ProductCard({ offer }: { offer: Offer }) {
     </div>
   );
 }
+
